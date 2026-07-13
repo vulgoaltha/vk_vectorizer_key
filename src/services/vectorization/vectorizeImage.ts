@@ -68,86 +68,140 @@ function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
+function despeckle(imageData: ImageData): ImageData {
+  const { width, height, data } = imageData;
+  const out = new Uint8ClampedArray(data);
+  const idx = (x: number, y: number) => (y * width + x) * 4;
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const c = idx(x, y);
+      let diffCount = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        for (let dx = -1; dx <= 1; dx++) {
+          if (dx === 0 && dy === 0) continue;
+          const n = idx(x + dx, y + dy);
+          const diff = Math.abs(data[c] - data[n]) + Math.abs(data[c+1] - data[n+1]) + Math.abs(data[c+2] - data[n+2]);
+          if (diff > 60) diffCount++;
+        }
+      }
+      if (diffCount >= 7) {
+        let r = 0, g = 0, b = 0, a = 0, n = 0;
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue;
+            const ni = idx(x + dx, y + dy);
+            r += data[ni]; g += data[ni+1]; b += data[ni+2]; a += data[ni+3]; n++;
+          }
+        }
+        out[c] = r / n; out[c+1] = g / n; out[c+2] = b / n; out[c+3] = a / n;
+      }
+    }
+  }
+  return new ImageData(out, width, height);
+}
+
 async function preprocess(file: File, opts: VectorizeOptions): Promise<ImageData> {
   const dataUrl = await fileToDataUrl(file);
   const img = await loadImage(dataUrl);
-  let { width, height } = img;
-  
-  if (Math.max(width, height) > opts.maxSize) {
-    const scale = opts.maxSize / Math.max(width, height);
-    width = Math.round(width * scale);
-    height = Math.round(height * scale);
+
+  let targetW = img.width;
+  let targetH = img.height;
+  if (Math.max(targetW, targetH) > opts.maxSize) {
+    const scale = opts.maxSize / Math.max(targetW, targetH);
+    targetW = Math.round(targetW * scale);
+    targetH = Math.round(targetH * scale);
   }
 
+  // Super-sample adaptativo: imagens pequenas ganham mais suavização
+  const SUPERSAMPLE = Math.max(1, Math.min(3, Math.round(1500 / Math.max(targetW, targetH))));
+
+  const bigCanvas = document.createElement("canvas");
+  bigCanvas.width = targetW * SUPERSAMPLE;
+  bigCanvas.height = targetH * SUPERSAMPLE;
+  const bigCtx = bigCanvas.getContext("2d")!;
+  bigCtx.imageSmoothingEnabled = true;
+  bigCtx.imageSmoothingQuality = "high";
+  bigCtx.drawImage(img, 0, 0, bigCanvas.width, bigCanvas.height);
+
   const canvas = document.createElement("canvas");
-  canvas.width = width;
-  canvas.height = height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("Canvas 2D context unavailable");
-
+  canvas.width = targetW;
+  canvas.height = targetH;
+  const ctx = canvas.getContext("2d")!;
   ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(img, 0, 0, width, height);
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(bigCanvas, 0, 0, targetW, targetH);
 
-  return ctx.getImageData(0, 0, width, height);
+  const imageData = ctx.getImageData(0, 0, targetW, targetH);
+  return despeckle(imageData);
 }
 
 // Extrator de Cores Puras (Clusterização por Média Real)
 export async function analyzeColorCount(file: File): Promise<string[]> {
   const dataUrl = await fileToDataUrl(file);
   const img = await loadImage(dataUrl);
-  
+
   const canvas = document.createElement("canvas");
   const ctx = canvas.getContext("2d");
-  if (!ctx) return ["#000000"]; 
+  if (!ctx) return ["#000000"];
 
-  const maxDim = 300;
+  const maxDim = 400;
   let width = img.width, height = img.height;
   if (Math.max(width, height) > maxDim) {
-      const scale = maxDim / Math.max(width, height);
-      width = Math.round(width * scale);
-      height = Math.round(height * scale);
+    const scale = maxDim / Math.max(width, height);
+    width = Math.round(width * scale);
+    height = Math.round(height * scale);
   }
   canvas.width = width; canvas.height = height;
+  ctx.imageSmoothingEnabled = true;
   ctx.drawImage(img, 0, 0, width, height);
   const data = ctx.getImageData(0, 0, width, height).data;
 
-  const colorMap = new Map<string, {count: number, r: number, g: number, b: number}>();
-  let totalOpaquePixels = 0;
+  const BUCKET = 12;
+  const colorMap = new Map<string, { count: number; r: number; g: number; b: number }>();
+  let totalStablePixels = 0;
 
-  for (let i = 0; i < data.length; i += 4) {
-      if (data[i + 3] < 50) continue; 
-      totalOpaquePixels++;
-      
-      const br = Math.round(data[i] / 24) * 24;
-      const bg = Math.round(data[i+1] / 24) * 24;
-      const bb = Math.round(data[i+2] / 24) * 24;
+  const px = (x: number, y: number) => {
+    const i = (y * width + x) * 4;
+    return [data[i], data[i+1], data[i+2], data[i+3]];
+  };
+
+  for (let y = 1; y < height - 1; y++) {
+    for (let x = 1; x < width - 1; x++) {
+      const i = (y * width + x) * 4;
+      if (data[i+3] < 200) continue;
+
+      const [r, g, b] = [data[i], data[i+1], data[i+2]];
+      let isEdge = false;
+      for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+        const [nr, ng, nb, na] = px(x + dx, y + dy);
+        if (na < 200 || Math.abs(nr - r) + Math.abs(ng - g) + Math.abs(nb - b) > 45) {
+          isEdge = true;
+          break;
+        }
+      }
+      if (isEdge) continue;
+
+      totalStablePixels++;
+      const br = Math.round(r / BUCKET) * BUCKET;
+      const bg = Math.round(g / BUCKET) * BUCKET;
+      const bb = Math.round(b / BUCKET) * BUCKET;
       const key = `${br},${bg},${bb}`;
-      
-      if (!colorMap.has(key)) {
-          colorMap.set(key, {count: 0, r: 0, g: 0, b: 0});
-      }
-      const bObj = colorMap.get(key);
-      bObj.count++;
-      bObj.r += data[i];
-      bObj.g += data[i+1];
-      bObj.b += data[i+2];
+      if (!colorMap.has(key)) colorMap.set(key, { count: 0, r: 0, g: 0, b: 0 });
+      const o = colorMap.get(key)!;
+      o.count++; o.r += r; o.g += g; o.b += b;
+    }
   }
 
-  const validColors: {hex: string, count: number}[] = [];
+  const validColors: { hex: string; count: number }[] = [];
   for (const val of colorMap.values()) {
-      if (val.count / totalOpaquePixels > 0.005) { // 0.5% Threshold
-          // Resgata o HEX exato da imagem, sem gerar "cores lamas"
-          const avgR = Math.round(val.r / val.count);
-          const avgG = Math.round(val.g / val.count);
-          const avgB = Math.round(val.b / val.count);
-          const hex = `#${avgR.toString(16).padStart(2, '0')}${avgG.toString(16).padStart(2, '0')}${avgB.toString(16).padStart(2, '0')}`;
-          validColors.push({hex, count: val.count});
-      }
+    if (val.count / totalStablePixels > 0.004) {
+      const hex = `#${Math.round(val.r/val.count).toString(16).padStart(2,'0')}${Math.round(val.g/val.count).toString(16).padStart(2,'0')}${Math.round(val.b/val.count).toString(16).padStart(2,'0')}`;
+      validColors.push({ hex, count: val.count });
+    }
   }
-
   validColors.sort((a, b) => b.count - a.count);
-  if (validColors.length === 0) return ["#000000"];
-  return validColors.map(v => v.hex);
+  return validColors.length ? validColors.map(v => v.hex) : ["#000000"];
 }
 
 export async function vectorizeImage(
@@ -176,21 +230,19 @@ export async function vectorizeImage(
   // 3. Configuração Nativa do ImageTracer
   const tracerOptions = {
     ltres: opts.ltres,
-    qtres: opts.qtres,
-    pathomit: opts.pathomit,
+    qtres: Math.max(opts.qtres, 2.5),
+    pathomit: Math.max(opts.pathomit, 15),
     roundcoords: opts.roundcoords || 2,
-    linefilter: opts.linefilter !== undefined ? opts.linefilter : true,
-    rightangleenhance: opts.rightangleenhance !== undefined ? opts.rightangleenhance : false,
-    blurradius: opts.blurradius || 0,
-    blurdelta: opts.blurradius ? 20 : 0,
-    
-    // O SEGREDO: O motor agora SÓ pode usar as cores exatas passadas pelo usuário/auto-detect
+    linefilter: true,
+    rightangleenhance: true,
+    blurradius: 0,
+    blurdelta: 0,
     pal: strictPalette,
-    
-    layering: true, // Z-Index nativo restaurado (Fim dos vazamentos)
+    layering: true,
+    strokewidth: 1.25,
     scale: 1,
     viewbox: true,
-    desc: false
+    desc: false,
   };
 
   const svg = ImageTracer.imagedataToSVG(imageData, tracerOptions);
