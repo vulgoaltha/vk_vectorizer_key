@@ -68,38 +68,7 @@ function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-function despeckle(imageData: ImageData): ImageData {
-  const { width, height, data } = imageData;
-  const out = new Uint8ClampedArray(data);
-  const idx = (x: number, y: number) => (y * width + x) * 4;
 
-  for (let y = 1; y < height - 1; y++) {
-    for (let x = 1; x < width - 1; x++) {
-      const c = idx(x, y);
-      let diffCount = 0;
-      for (let dy = -1; dy <= 1; dy++) {
-        for (let dx = -1; dx <= 1; dx++) {
-          if (dx === 0 && dy === 0) continue;
-          const n = idx(x + dx, y + dy);
-          const diff = Math.abs(data[c] - data[n]) + Math.abs(data[c+1] - data[n+1]) + Math.abs(data[c+2] - data[n+2]);
-          if (diff > 60) diffCount++;
-        }
-      }
-      if (diffCount >= 7) {
-        let r = 0, g = 0, b = 0, a = 0, n = 0;
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            if (dx === 0 && dy === 0) continue;
-            const ni = idx(x + dx, y + dy);
-            r += data[ni]; g += data[ni+1]; b += data[ni+2]; a += data[ni+3]; n++;
-          }
-        }
-        out[c] = r / n; out[c+1] = g / n; out[c+2] = b / n; out[c+3] = a / n;
-      }
-    }
-  }
-  return new ImageData(out, width, height);
-}
 
 async function preprocess(file: File, opts: VectorizeOptions): Promise<ImageData> {
   const dataUrl = await fileToDataUrl(file);
@@ -133,7 +102,50 @@ async function preprocess(file: File, opts: VectorizeOptions): Promise<ImageData
   ctx.drawImage(bigCanvas, 0, 0, targetW, targetH);
 
   const imageData = ctx.getImageData(0, 0, targetW, targetH);
-  return despeckle(imageData);
+  return imageData;
+}
+
+function mergeSimilarColors(
+  colors: { hex: string; count: number }[],
+  threshold = 30
+): string[] {
+  const hexToRgb = (h: string): [number, number, number] => [
+    parseInt(h.slice(1, 3), 16),
+    parseInt(h.slice(3, 5), 16),
+    parseInt(h.slice(5, 7), 16),
+  ];
+  type Bucket = { r: number; g: number; b: number; count: number };
+  const buckets: Bucket[] = [];
+
+  for (const c of colors) {
+    const [r, g, b] = hexToRgb(c.hex);
+    let matched = false;
+    for (const bucket of buckets) {
+      const avgR = bucket.r / bucket.count;
+      const avgG = bucket.g / bucket.count;
+      const avgB = bucket.b / bucket.count;
+      const dist = Math.abs(avgR - r) + Math.abs(avgG - g) + Math.abs(avgB - b);
+      if (dist <= threshold) {
+        bucket.r += r * c.count;
+        bucket.g += g * c.count;
+        bucket.b += b * c.count;
+        bucket.count += c.count;
+        matched = true;
+        break;
+      }
+    }
+    if (!matched) {
+      buckets.push({ r: r * c.count, g: g * c.count, b: b * c.count, count: c.count });
+    }
+  }
+
+  buckets.sort((a, b) => b.count - a.count);
+  return buckets.map((b) => {
+    const r = Math.round(b.r / b.count);
+    const g = Math.round(b.g / b.count);
+    const bb = Math.round(b.b / b.count);
+    return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${bb.toString(16).padStart(2, "0")}`;
+  });
 }
 
 // Extrator de Cores Puras (Clusterização por Média Real)
@@ -201,7 +213,120 @@ export async function analyzeColorCount(file: File): Promise<string[]> {
     }
   }
   validColors.sort((a, b) => b.count - a.count);
-  return validColors.length ? validColors.map(v => v.hex) : ["#000000"];
+  const merged = mergeSimilarColors(validColors, 30);
+  return merged.length ? merged : ["#000000"];
+}
+
+function buildLabelMap(
+  imageData: ImageData,
+  palette: { r: number; g: number; b: number; a: number }[]
+): Int32Array {
+  const { width, height, data } = imageData;
+  const labels = new Int32Array(width * height);
+  for (let p = 0; p < width * height; p++) {
+    const i = p * 4;
+    const r = data[i], g = data[i + 1], b = data[i + 2], a = data[i + 3];
+    if (a < 30) { labels[p] = -1; continue; }
+    let best = 0, bestDist = Infinity;
+    for (let k = 0; k < palette.length; k++) {
+      const c = palette[k];
+      if (c.a === 0) continue;
+      const d = (r - c.r) ** 2 + (g - c.g) ** 2 + (b - c.b) ** 2;
+      if (d < bestDist) { bestDist = d; best = k; }
+    }
+    labels[p] = best;
+  }
+  return labels;
+}
+
+function maskFromLabel(labels: Int32Array, colorIndex: number): Uint8Array {
+  const out = new Uint8Array(labels.length);
+  for (let i = 0; i < labels.length; i++) out[i] = labels[i] === colorIndex ? 1 : 0;
+  return out;
+}
+
+const NEIGHBORS_4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+
+function erode(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(mask.length);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (mask[i] === 0) { out[i] = 0; continue; }
+      let keep = 1;
+      for (const [dx, dy] of NEIGHBORS_4) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height || mask[ny * width + nx] === 0) {
+          keep = 0; break;
+        }
+      }
+      out[i] = keep;
+    }
+  }
+  return out;
+}
+
+function dilate(mask: Uint8Array, width: number, height: number): Uint8Array {
+  const out = new Uint8Array(mask.length);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = y * width + x;
+      if (mask[i] === 1) { out[i] = 1; continue; }
+      let fill = 0;
+      for (const [dx, dy] of NEIGHBORS_4) {
+        const nx = x + dx, ny = y + dy;
+        if (nx >= 0 && ny >= 0 && nx < width && ny < height && mask[ny * width + nx] === 1) {
+          fill = 1; break;
+        }
+      }
+      out[i] = fill;
+    }
+  }
+  return out;
+}
+
+// Abertura (remove ilhas/franjas pequenas) + Fechamento (fecha mordidas/buracos)
+function cleanMask(mask: Uint8Array, width: number, height: number): Uint8Array {
+  let m = erode(mask, width, height);
+  m = dilate(m, width, height);
+  m = dilate(m, width, height);
+  m = erode(m, width, height);
+  return m;
+}
+
+function compositeCleanedLayers(
+  imageData: ImageData,
+  palette: { r: number; g: number; b: number; a: number }[]
+): ImageData {
+  const { width, height } = imageData;
+  const labels = buildLabelMap(imageData, palette);
+
+  const counts = new Array(palette.length).fill(0);
+  for (const l of labels) if (l >= 0) counts[l]++;
+
+  const order = palette
+    .map((_, idx) => idx)
+    .filter((idx) => palette[idx].a !== 0)
+    .sort((a, b) => counts[b] - counts[a]); // maior área primeiro (fundo), menor por cima (detalhes)
+
+  const finalLabel = new Int32Array(width * height).fill(-1);
+  for (const colorIndex of order) {
+    const rawMask = maskFromLabel(labels, colorIndex);
+    const cleaned = cleanMask(rawMask, width, height);
+    for (let i = 0; i < cleaned.length; i++) {
+      if (cleaned[i] === 1) finalLabel[i] = colorIndex;
+    }
+  }
+
+  const out = new Uint8ClampedArray(width * height * 4);
+  for (let i = 0; i < finalLabel.length; i++) {
+    const l = finalLabel[i];
+    const o = i * 4;
+    if (l === -1) { out[o + 3] = 0; continue; }
+    const c = palette[l];
+    out[o] = c.r; out[o + 1] = c.g; out[o + 2] = c.b; out[o + 3] = 255;
+  }
+  return new ImageData(out, width, height);
 }
 
 export async function vectorizeImage(
@@ -229,8 +354,9 @@ export async function vectorizeImage(
 
   // 3. Configuração Nativa do ImageTracer
   const tracerOptions = {
-    ltres: opts.ltres,
+    ltres: Math.max(opts.ltres, 1.5),
     qtres: Math.max(opts.qtres, 2.5),
+    colorquantcycles: 8,
     pathomit: Math.max(opts.pathomit, 15),
     roundcoords: opts.roundcoords || 2,
     linefilter: true,
@@ -245,10 +371,13 @@ export async function vectorizeImage(
     desc: false,
   };
 
-  const svg = ImageTracer.imagedataToSVG(imageData, tracerOptions);
+  const cleanedImageData = compositeCleanedLayers(imageData, strictPalette);
+  const svg = ImageTracer.imagedataToSVG(cleanedImageData, tracerOptions);
+  const backgroundHex = activeHex[0] ?? "#ffffff";
+  const finalSvg = injectBackgroundRect(svg, backgroundHex, imageData.width, imageData.height);
   
   const durationMs = performance.now() - start;
-  return { svg, width: imageData.width, height: imageData.height, durationMs };
+  return { svg: finalSvg, width: imageData.width, height: imageData.height, durationMs };
 }
 
 export function downloadBlob(blob: Blob, filename: string) {
@@ -280,4 +409,9 @@ export async function svgToPdfBlob(
   if (!svgEl) throw new Error("Invalid SVG");
   await svg2pdf(svgEl as unknown as Element, pdf, { width, height });
   return pdf.output("blob");
+}
+
+function injectBackgroundRect(svg: string, bgHex: string, width: number, height: number): string {
+  const rect = `<rect x="0" y="0" width="${width}" height="${height}" fill="${bgHex}"/>`;
+  return svg.replace(/(<svg[^>]*>)/, `$1${rect}`);
 }
