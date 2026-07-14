@@ -1,11 +1,11 @@
 // @ts-nocheck
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Upload, Download, Loader2, Sparkles, ImageIcon } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Slider } from "@/components/ui/slider";
-import { Switch } from "@/components/ui/switch";
-import { Label } from "@/components/ui/label";
-import { Card } from "@/components/ui/card";
+import { Button } from "@/shared/components/ui/button";
+import { Slider } from "@/shared/components/ui/slider";
+import { Switch } from "@/shared/components/ui/switch";
+import { Label } from "@/shared/components/ui/label";
+import { Card } from "@/shared/components/ui/card";
 import {
   vectorizeImage,
   svgToPdfBlob,
