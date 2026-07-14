@@ -380,6 +380,12 @@ export async function vectorizeImage(
   return { svg: finalSvg, width: imageData.width, height: imageData.height, durationMs };
 }
 
+export function generateDownloadFileName(originalName: string, extension: string): string {
+  const baseName = originalName.replace(/\.[^/.]+$/, "");
+  const sanitized = baseName.replace(/[<>:"/\\|?*]/g, "").trim() || "Image";
+  return `${sanitized}-VK.${extension}`;
+}
+
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");

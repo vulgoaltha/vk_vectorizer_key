@@ -10,6 +10,7 @@ import {
   vectorizeImage,
   svgToPdfBlob,
   downloadBlob,
+  generateDownloadFileName,
   DEFAULT_OPTIONS,
   PRESETS,
   analyzeColorCount,
@@ -109,24 +110,24 @@ export function ImageToVector() {
   }, [result]);
 
   const downloadSvg = useCallback(() => {
-    if (!result) return;
+    if (!result || !file) return;
     const blob = new Blob([result.svg], { type: "image/svg+xml" });
-    downloadBlob(blob, "vector.svg");
-  }, [result]);
+    downloadBlob(blob, generateDownloadFileName(file.name, "svg"));
+  }, [result, file]);
 
   const downloadPdf = useCallback(async () => {
-    if (!result) return;
+    if (!result || !file) return;
     try {
       setBusy(true);
       const blob = await svgToPdfBlob(result.svg, result.width, result.height);
-      downloadBlob(blob, "vector.pdf");
+      downloadBlob(blob, generateDownloadFileName(file.name, "pdf"));
     } catch (e) {
       console.error("[Vectorizer] PDF error", e);
       setError("Falha ao gerar PDF");
     } finally {
       setBusy(false);
     }
-  }, [result]);
+  }, [result, file]);
 
   return (
     <div className="mx-auto w-full max-w-6xl space-y-8 p-4 sm:p-6 lg:p-8">
